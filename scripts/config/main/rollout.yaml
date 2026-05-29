@@ -3,7 +3,18 @@ defaults:
   - _self_
 
 policy_config:
-  checkpoint_path: "model.pt"  # Model checkpoint to use for rollout
+  checkpoint_path: "model.pt"  # Model checkpoint to use for rollout (ignored when api is set below)
+
+  # --- Closed-source / relay policy backend (OPTIONAL, opt-in) -----------------
+  # Uncomment to drive rollouts with an OpenAI-compatible API (e.g. new-api / yunwu
+  # relay serving gpt-5.4) instead of a self-hosted vLLM server. When this block is
+  # absent, rollout behaves exactly as before (vLLM). The OpenAI-format message
+  # array sent each step is still saved as Response.raw_prompt in the trajectories.
+  # api:
+  #   base_url: "https://yunwu.ai/v1"     # relay root (with or without /v1)
+  #   model: "gpt-5.4"
+  #   api_key_env_var: "POLICY_API_KEY"   # export the key in this env var; never hardcode
+  # ----------------------------------------------------------------------------
 
 env_config:
   cpu_cluster_token_env_var: "CPU_CLUSTER_TOKEN"

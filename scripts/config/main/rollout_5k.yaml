@@ -1,0 +1,65 @@
+# Production 5k-trajectory rollout: gpt-5.4 policy via yunwu, sealed 5-IP browser proxy.
+# Same plumbing as rollout_smoke, scaled up + resumable checkpointing.
+defaults:
+  - default
+  - rollout
+  - _self_
+
+save_path: /root/autodl-tmp/webgym_runs/run5k
+data_path: /root/autodl-tmp/.cache/huggingface/hub/datasets--microsoft--webgym_tasks/snapshots/a61330203480bea9b90b8e954ecf0b084a114cca
+
+model_config:
+  model_type: "qwen3-instruct"
+  prompt_version: "complete"
+
+policy_config:
+  checkpoint_path: ""
+  max_new_tokens: 3072
+  temperature: 1
+  top_p: 0.99
+  api:
+    base_url: "https://yunwu.ai/v1"
+    model: "gpt-5.4"
+    api_key_env_var: "POLICY_API_KEY"
+    max_retries: 8            # rate-limit resilience: retries 429/5xx/network before failing a step
+    backoff_cap_sec: 60       # max wait between retries (honors server Retry-After header)
+
+env_config:
+  server_size: 24              # concurrent browsers/trajectories
+  max_vllm_sessions: 24        # concurrent gpt-5.4 calls (yunwu has no rate limit)
+  host_ip: "localhost"
+  master_port: 7000
+  cpu_cluster_token_env_var: "CPU_CLUSTER_TOKEN"
+  vllm_server_url: "http://localhost:8999"   # unused with policy api
+  verbose: false
+
+  split: "train"
+  train_tasks: "train.jsonl"
+  test_tasks: ""
+  train_tasks_rollout_size: 5000   # <-- 5k trajectories
+  test_tasks_rollout_size: 0
+  test_tasks_repeat_times: 0
+  train_tasks_sampler: "uniform"
+
+  # real step budgets (easy/medium/hard by difficulty 1-3 / 4-6 / 7+)
+  train_difficulty_max_steps:
+    easy: 10
+    medium: 20
+    hard: 30
+  test_difficulty_max_steps: []
+
+  completion_threshold: 0.95
+  completion_grace_period: 30
+  save_traj_progress: true     # resumable: incremental checkpoints every 25%
+  save_every_percent: 25
+
+openai_config:
+  model: "gpt-5.4-mini"
+  openai_api_key_env_var: "POLICY_API_KEY"
+  base_url: "https://yunwu.ai/v1"
+  keypoint_detection:
+    model: "gpt-5.4-mini"
+  blocking_detection:
+    model: "gpt-5.4-mini"
+  evaluation:
+    model: "gpt-5.4-mini"

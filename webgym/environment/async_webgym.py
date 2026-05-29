@@ -169,11 +169,14 @@ class AsyncWebGym:
             monitor_max_steps = 100  # Fallback default
 
         # Enhanced Task Monitor with fine-grained status
+        # web_port default 6006 so AutoDL's built-in "自定义服务" proxy exposes it directly;
+        # override via env_config.web_dashboard_port.
+        _web_port = int(getattr(self.env_config, 'web_dashboard_port', 6006)) if self.env_config else 6006
         self.monitor = TaskMonitor(
             total_tasks=self.total_tasks,
             max_steps=monitor_max_steps,
             enable_web_dashboard=True,
-            web_port=5000
+            web_port=_web_port
         )
         
         # System stats
@@ -211,12 +214,15 @@ class AsyncWebGym:
                 # Get task progress
                 progress = self.monitor.get_progress_summary() if hasattr(self.monitor, 'get_progress_summary') else {}
                 
-                # Alert conditions only
-                if http_stats['stack_size'] > 100:
-                    print(f"⚠️  Large HTTP stack: {http_stats['stack_size']} requests waiting")
-                
-                if http_stats['success_rate'] < 80 and http_stats['completed'] > 20:
-                    print(f"⚠️  Low HTTP success rate: {http_stats['success_rate']:.1f}%")
+                # Alert conditions only (keys vary by stack backend -> use .get defaults)
+                stack_size = http_stats.get('stack_size', http_stats.get('queue_size', 0))
+                if stack_size > 100:
+                    print(f"⚠️  Large HTTP stack: {stack_size} requests waiting")
+
+                success_rate = http_stats.get('success_rate', 100)
+                completed = http_stats.get('completed', 0)
+                if success_rate < 80 and completed > 20:
+                    print(f"⚠️  Low HTTP success rate: {success_rate:.1f}%")
                 
                 # Performance warnings
                 if progress.get('action', 0) > 20:

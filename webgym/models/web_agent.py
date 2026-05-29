@@ -45,6 +45,49 @@ class WebAgent:
         self.max_retries = max_retries
         self.max_vllm_sessions = max_vllm_sessions
 
+        # ----------------------------------------------------------------
+        # Optional closed-source / relay policy backend (OpenAI-compatible).
+        # Activated ONLY when policy_config.api.base_url is set. When unset,
+        # everything below falls through to the original vLLM path unchanged.
+        #   policy_config:
+        #     api:
+        #       base_url: "https://yunwu.ai/v1"   # OpenAI-compatible relay root
+        #       model: "gpt-5.4"
+        #       api_key_env_var: "POLICY_API_KEY" # key read from env, never hardcoded
+        # ----------------------------------------------------------------
+        policy_api = getattr(policy_config, 'api', None)
+        self.policy_api = policy_api if (policy_api and getattr(policy_api, 'base_url', None)) else None
+        self.use_policy_api = self.policy_api is not None
+        self.policy_api_key = None
+        if self.use_policy_api:
+            key_env_var = getattr(self.policy_api, 'api_key_env_var', 'POLICY_API_KEY')
+            if key_env_var not in os.environ:
+                raise ValueError(
+                    f"policy_config.api is set but env var '{key_env_var}' is not exported. "
+                    f"Export your relay API key first, e.g. export {key_env_var}=sk-..."
+                )
+            self.policy_api_key = os.environ[key_env_var]
+            self.policy_api_model = getattr(self.policy_api, 'model', None)
+            if not self.policy_api_model:
+                raise ValueError("policy_config.api.model must be set (e.g. 'gpt-5.4').")
+            # Dedicated, generous retry policy for rate-limited relays (independent of
+            # the global http max_retries which is tuned for the omnibox HTTP stack).
+            self.policy_api_max_retries = int(getattr(self.policy_api, 'max_retries', 8))
+            self.policy_api_backoff_cap = float(getattr(self.policy_api, 'backoff_cap_sec', 60))
+            # Normalize endpoint URL to .../v1/chat/completions
+            base = str(self.policy_api.base_url).rstrip('/')
+            if base.endswith('/chat/completions'):
+                self.policy_api_url = base
+            elif base.endswith('/v1'):
+                self.policy_api_url = base + '/chat/completions'
+            else:
+                self.policy_api_url = base + '/v1/chat/completions'
+            if verbose:
+                print(f"🌐 Policy backend: OpenAI-compatible API")
+                print(f"   - Endpoint: {self.policy_api_url}")
+                print(f"   - Model: {self.policy_api_model}")
+                print(f"   - API key from env: {key_env_var}")
+
         # Configure vLLM HTTP client with connection pooling
         self.vllm_client = httpx.Client(
             limits=httpx.Limits(
@@ -72,8 +115,8 @@ class WebAgent:
             print(f"   - Request timeout: {vllm_timeout}s")
             print(f"   - Concurrent requests: {max_vllm_sessions}")
 
-        # Pre-warm connection pool for large session counts
-        if max_vllm_sessions > 10:
+        # Pre-warm connection pool for large session counts (vLLM only; relays have no /health)
+        if max_vllm_sessions > 10 and not self.use_policy_api:
             self._prewarm_connection_pool(verbose=verbose)
 
         # These will be set by concrete implementations
@@ -257,6 +300,10 @@ class WebAgent:
 
     def _make_vllm_request_direct(self, messages: List[Dict]):
         """Make direct vLLM request using httpx - let vLLM do the batching"""
+        # Route to closed-source / relay API when configured (opt-in, vLLM path untouched otherwise)
+        if self.use_policy_api:
+            return self._make_policy_api_request(messages)
+
         model_name = getattr(self.policy_config, 'base_model', 'unknown')
 
         payload = {
@@ -310,6 +357,121 @@ class WebAgent:
                         error_msg = str(e)
                         print(f"   🔄 vLLM request attempt {attempt + 1} failed: {error_msg[:100]}")
                         time.sleep(1 + attempt)
+
+    def _inline_images_as_base64(self, messages: List[Dict]) -> List[Dict]:
+        """Return a copy of messages with any file:// image_url converted to a
+        base64 data URL, so a remote API (no local FS access) can read the images.
+        Non-image content and already-base64/http URLs are passed through untouched.
+        """
+        from webgym.utils import encode_image_to_base64
+
+        out = []
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                out.append(msg)
+                continue
+            new_content = []
+            for item in content:
+                if item.get("type") == "image_url":
+                    url = item.get("image_url", {}).get("url", "")
+                    if url.startswith("file://"):
+                        local_path = url[len("file://"):]
+                        item = {"type": "image_url",
+                                "image_url": {"url": encode_image_to_base64(local_path)}}
+                new_content.append(item)
+            out.append({**msg, "content": new_content})
+        return out
+
+    def _make_policy_api_request(self, messages: List[Dict]):
+        """Make a policy request to an OpenAI-compatible closed-source / relay API.
+
+        Sends only standard chat-completions params (relays reject vLLM-only fields
+        like top_k/min_p/logprobs/echo). The returned content is parsed downstream
+        by the same model-specific parser, so the rest of the pipeline is unchanged.
+        """
+        # A remote relay cannot read local file:// images -> inline them as base64.
+        # Build a converted COPY so the caller's original messages (which storage
+        # expects to keep file:// URLs) are left untouched.
+        api_messages = self._inline_images_as_base64(messages)
+        payload = {
+            "model": self.policy_api_model,
+            "messages": api_messages,
+            "temperature": getattr(self.policy_config, 'temperature', 0.7),
+            "top_p": getattr(self.policy_config, 'top_p', 1.0),
+            "max_tokens": getattr(self.policy_config, 'max_new_tokens', 512),
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.policy_api_key}",
+        }
+
+        import random
+        max_retries = self.policy_api_max_retries
+        cap = self.policy_api_backoff_cap
+        # Status codes worth retrying (transient). Everything else (400/401/403/404)
+        # is a config/auth/request error that retries won't fix -> fail fast.
+        RETRYABLE = {408, 409, 425, 429, 500, 502, 503, 504, 522, 524}
+
+        def _backoff(attempt, retry_after=None):
+            # Honor server's Retry-After if present, else exponential + full jitter, capped.
+            if retry_after is not None:
+                return min(retry_after, cap)
+            return min(cap, (2 ** attempt) * (0.5 + random.random()))  # jittered, hard-capped at cap
+
+        with self.vllm_semaphore:
+            for attempt in range(max_retries + 1):
+                last = attempt == max_retries
+                try:
+                    response = self.vllm_client.post(
+                        self.policy_api_url, json=payload, headers=headers
+                    )
+
+                    code = response.status_code
+
+                    if code == 200:
+                        # Parse defensively: relays sometimes return an empty / non-JSON
+                        # 200 body (gateway hiccup) -> treat as transient and retry.
+                        try:
+                            data = response.json()
+                            message = data["choices"][0]["message"]
+                            content = message.get("content") or ""
+                            if message.get("reasoning_content"):
+                                content = f"<think>\n{message['reasoning_content']}\n</think>\n\n{content}"
+                            if not content.strip():
+                                raise ValueError("empty content in 200 response")
+                            return content
+                        except (ValueError, KeyError, IndexError, TypeError) as pe:
+                            if last:
+                                raise Exception(f"policy API bad 200 body after {max_retries + 1} attempts: {pe}; body={response.text[:160]}")
+                            delay = _backoff(attempt)
+                            print(f"   🔄 policy API bad 200 body (attempt {attempt + 1}/{max_retries + 1}): {str(pe)[:80]}; retrying in {delay:.1f}s")
+                            time.sleep(delay)
+                            continue
+
+                    body = response.text[:200]
+                    # Non-retryable client errors: stop immediately, surface clearly.
+                    if code not in RETRYABLE:
+                        raise Exception(f"policy API non-retryable {code}: {body}")
+                    if last:
+                        raise Exception(f"policy API still {code} after {max_retries + 1} attempts: {body}")
+                    # Honor Retry-After header (seconds) when the relay sends it.
+                    ra = response.headers.get("retry-after")
+                    try:
+                        ra = float(ra) if ra is not None else None
+                    except (TypeError, ValueError):
+                        ra = None
+                    delay = _backoff(attempt, ra)
+                    print(f"   🔄 policy API {code} (attempt {attempt + 1}/{max_retries + 1}); retrying in {delay:.1f}s")
+                    time.sleep(delay)
+
+                except httpx.HTTPError as e:
+                    # Network-level errors (timeout, connect reset) are transient -> retry.
+                    if last:
+                        raise Exception(f"policy API network error after {max_retries + 1} attempts: {e}")
+                    delay = _backoff(attempt)
+                    print(f"   🔄 policy API network error (attempt {attempt + 1}/{max_retries + 1}): {str(e)[:80]}; retrying in {delay:.1f}s")
+                    time.sleep(delay)
 
     def _build_http_messages(self, system_prompt: str, user_prompt: str,
                            screenshot_path: str, trajectory: list = None):

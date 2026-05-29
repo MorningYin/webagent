@@ -1,0 +1,63 @@
+# Smoke-test rollout: gpt-5.4 policy via yunwu relay, sealed browser proxy, data on autodl-tmp.
+# Extends rollout_train but tiny scale, closed-source API policy, no GPU/vLLM.
+defaults:
+  - default
+  - rollout
+  - _self_
+
+save_path: /root/autodl-tmp/webgym_runs/smoke
+data_path: /root/autodl-tmp/.cache/huggingface/hub/datasets--microsoft--webgym_tasks/snapshots/a61330203480bea9b90b8e954ecf0b084a114cca
+
+model_config:
+  model_type: "qwen3-instruct"   # keep Qwen prompt/parser; gpt-5.4 must follow this format
+  prompt_version: "complete"
+
+policy_config:
+  checkpoint_path: ""            # no local checkpoint; pure API policy
+  max_new_tokens: 3072
+  temperature: 1
+  top_p: 0.99
+  api:                           # <-- closed-source policy backend (the branch we added)
+    base_url: "https://yunwu.ai/v1"
+    model: "gpt-5.4"
+    api_key_env_var: "POLICY_API_KEY"
+
+env_config:
+  server_size: 4
+  max_vllm_sessions: 4           # gates concurrent API calls
+  host_ip: "localhost"
+  master_port: 7000
+  cpu_cluster_token_env_var: "CPU_CLUSTER_TOKEN"   # = default_key
+  vllm_server_url: "http://localhost:8999"          # unused when policy api is set
+  verbose: true
+
+  split: "train"
+  train_tasks: "train.jsonl"
+  test_tasks: ""
+  train_tasks_rollout_size: 3    # smoke: just 3 tasks
+  test_tasks_rollout_size: 0
+  test_tasks_repeat_times: 0
+  train_tasks_sampler: "uniform"
+
+  # cap steps low so smoke finishes fast
+  train_difficulty_max_steps:
+    easy: 5
+    medium: 8
+    hard: 10
+  test_difficulty_max_steps: []
+
+  completion_threshold: 0.99
+  completion_grace_period: 20
+  save_traj_progress: false
+
+# Evaluator (reward + blocking detection) -> yunwu gpt-5.4-mini, reuse same key
+openai_config:
+  model: "gpt-5.4-mini"
+  openai_api_key_env_var: "POLICY_API_KEY"
+  base_url: "https://yunwu.ai/v1"
+  keypoint_detection:
+    model: "gpt-5.4-mini"
+  blocking_detection:
+    model: "gpt-5.4-mini"
+  evaluation:
+    model: "gpt-5.4-mini"

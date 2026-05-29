@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict
 from io import BytesIO
 
@@ -26,9 +27,17 @@ class PlaywrightInstance(InstanceBase):
 
     async def _create(self) -> None:
         self.p = await async_playwright().start()
-        self.browser = await self.p.chromium.launch()
-        self.context = await self.browser.new_context(
-            viewport={'width': 1280, 'height': 768})
+        # Dedicated browser egress proxy (e.g. the sealed 7891 instance that
+        # load-balances across static egress IPs). Empty/unset -> direct, no proxy.
+        proxy_server = os.environ.get("OMNIBOX_BROWSER_PROXY", "").strip()
+        launch_kwargs = {}
+        context_kwargs = {"viewport": {"width": 1280, "height": 768}}
+        if proxy_server:
+            proxy_cfg = {"server": proxy_server}
+            launch_kwargs["proxy"] = proxy_cfg
+            context_kwargs["proxy"] = proxy_cfg
+        self.browser = await self.p.chromium.launch(**launch_kwargs)
+        self.context = await self.browser.new_context(**context_kwargs)
         self.page = await self.context.new_page()
         await self.controller.on_new_page(self.page)
 
