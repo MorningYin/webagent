@@ -1309,6 +1309,16 @@ class AsyncWebGym:
                     if prev_step.get('response'):
                         prev_step['response'].answering_tokens['observation'] = observation_text
 
+                # Fold the just-completed previous step into the bounded running log
+                # (long-term memory), and store it on the CURRENT step so the conversation
+                # builder injects it as "Notes so far". update_running_log is robust:
+                # on any summarizer failure it returns the previous log unchanged.
+                if len(trajectory) > 1:
+                    base_log = trajectory[-2].get('running_log', '') or ''
+                    trajectory[-1]['running_log'] = agent.update_running_log(base_log, trajectory[-2])
+                else:
+                    trajectory[-1]['running_log'] = ''
+
                 # Get action from vLLM (no process isolation needed - different server)
                 check_timeout()
                 self.monitor.set_task_getting_action(task_id)

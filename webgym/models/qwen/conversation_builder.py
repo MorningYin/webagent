@@ -69,10 +69,13 @@ class QwenConversationBuilder(ConversationBuilder):
         else:
             first_user_text = f"Please generate the next action according to the UI screenshot and task.\n\nTask: {task}\n\n"
 
-        if older_steps:
-            # Summarize older steps (focus on state/progress/blockers, not visual details)
-            summary = self._summarize_older_history(older_steps)
-            first_user_text += f"Previous actions summary:\n{summary}\n\n"
+        # Long-term memory: bounded running log maintained incrementally by the
+        # summarizer model (stored on the current trajectory step by the rollout loop).
+        running_log = ""
+        if trajectory:
+            running_log = trajectory[-1].get('running_log') or ""
+        if running_log:
+            first_user_text += f"Notes so far (your memory of earlier steps):\n{running_log}\n\n"
 
         first_user_text += "Generate the next action to complete the task."
 
@@ -129,27 +132,20 @@ class QwenConversationBuilder(ConversationBuilder):
             # Complete version: includes Progress, Intention, Action, and tool call
             response_format = """
 
-# Response format
+# How to respond
 
-Response format for every step:
-1) Memory: facts you would like to memorize for future actions in json format. Include the current step.
-2) Progress: Decompose the task into subtasks and what has been finished so far with json format. Include progress of the current step.
-3) Intention: clearly state which subtask you're working on at this step with the json key.
-4) Action: a short sentence describing what to do in the UI to accomplish the next subtask.
-5) A single <tool_call>...</tool_call> block containing only the JSON: {"name": <function-name>, "arguments": <args-json-object>}.
+For each step, output these parts in order:
+1) Thought: reason about what you currently see and the single objective you are pursuing right now — what you are trying to achieve at this moment and how your next action moves it forward. If the objective you were just pursuing has succeeded or has proven blocked, say so here before turning to the next one. Reason about the present situation only; do not pre-plan the whole task or enumerate future subtasks.
+2) Action: one short sentence describing the UI action you will take.
+3) A single <tool_call>...</tool_call> block containing only the JSON: {"name": <function-name>, "arguments": <args-json-object>}.
 
-Rules:
-- Output exactly in the order: Memory, Progress, Intention, Action, <tool_call>.
-- You MUST use json format for the Memory and Progress parts.
-- Example Task: "Search and compare the prices and locations of product 1 and product 2 on Amazon."
-  - Example of Memory json format: {"Price of product 1": "10.00", "Location of product 1": "10.00", "Price of produce 2": "12.00"}.
-  - Example of Progress json format: {"Go to Amazon.com": "finished", "Search for price of product 1": "finished", "Search for location of product 1": "finished", "Search for price of product 2": "finished", "Search for location of product 2": "not finished", "Compare product 1 and product 2": "not finished"}.
-  - Example of Intention json key format: "Search for location of product 2".
-- You CAN NOT modify previous Memory. Only append to it.
-- You CAN modify Progress from previous conversation to further decompose the task and guide your next action.
-  - For example, if the previous assistant message specifies Progress: {"Go to Amazon.com": "finished", "Search for product 1": "finished", "Search for product 2": "not finished", "Compare product 1 and 2": "not finished"},
-  - You should further decompose "Search for product 1" and "Search for product 2" into "Search for price of product 1" and "Search for location of product 1", and "Search for price of product 2" and "Search for location of product 2".
-- Do not output anything else outside those five parts."""
+A running record of your earlier findings is provided to you under "Notes so far" — rely on it for facts from steps that have scrolled out of view; you do not need to restate it.
+
+Work like a focused researcher:
+- Pursue one objective at a time. Stay on it until you achieve it or confirm it is blocked — never switch to an unrelated direction in the middle of one.
+- Treat each objective as a self-contained unit of work with a clear point and a clear outcome.
+- Ground every action in what is actually on the current screen. If a page is blocked, blank, or interrupts you (cookie/consent/popup), handle that as part of the objective you are on rather than abandoning it.
+- Once the task is fully answered by what you have actually seen, give the final answer."""
         else:
             # Vanilla version: minimal format without Thoughts or Memory
             response_format = """
@@ -275,8 +271,13 @@ For each function call, return a JSON object with function name and arguments wi
         if not older_steps:
             return ""
 
+        # Bound the summary to the most recent SUMMARY_WINDOW older steps so the text
+        # payload stays ~constant regardless of trajectory length. Long-horizon facts
+        # are carried by the model's own Memory field, not by ever-growing summaries.
+        SUMMARY_WINDOW = 10
+        n_omitted = max(0, len(older_steps) - SUMMARY_WINDOW)
         summary_lines = []
-        for i, step in enumerate(older_steps):
+        for i, step in enumerate(older_steps[n_omitted:], start=n_omitted):
             observation = step.get('observation')
             action = step.get('action')
             response = step.get('response')
@@ -334,7 +335,9 @@ For each function call, return a JSON object with function name and arguments wi
         if not summary_lines:
             return "No previous actions."
 
-        return "\n".join(summary_lines)
+        prefix = (f"(... {n_omitted} earlier steps omitted; their key results are retained in Memory ...)\n"
+                  if n_omitted > 0 else "")
+        return prefix + "\n".join(summary_lines)
 
     def _build_assistant_message(self, response: Any) -> Dict:
         """Build assistant message from response

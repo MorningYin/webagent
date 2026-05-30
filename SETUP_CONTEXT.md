@@ -224,3 +224,42 @@ env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u al
 - `answering_tokens`：解析出的 `{thought, action, tool_call, memory, ...}`。
 截图在 `{save_path}/images/<task>/step_*.png`。
 ```
+
+---
+
+## UPDATE — 最终 harness(多站路由 + 有界 context)
+
+这一版相对上面的单站版做了重大升级。要点:
+
+### 运行环境变量(启动 rollout 前 export)
+```
+export POLICY_API_KEY_YUNWU=<yunwu key>            # 兜底站
+export POLICY_API_KEY_NEWAPI=<new-api 账号1 key>    # 主力站(同一网关,RPM 独立)
+export POLICY_API_KEY_NEWAPI2=<new-api 账号2 key>
+export POLICY_API_KEY_NEWAPI3=<new-api 账号3 key>
+export POLICY_NEWAPI_BASE_URL=https://<your-newapi-host>/v1/chat/completions  # 私有中转站地址,不入库
+export CPU_CLUSTER_TOKEN=default_key
+```
+yunwu 的 base_url 是公开的 `https://yunwu.ai/v1`(写在配置里);new-api 的地址走 `POLICY_NEWAPI_BASE_URL`,所以仓库里不含私有域名。
+
+### 多站策略路由(webgym/models/web_agent.py)
+- `policy_config.api.endpoints` 列表:每个站 = base_url(或 base_url_env_var)+ api_key_env_var + weight + 可选 `fallback: true`。
+- **分层 + 加固故障转移**:单次调用先在 PRIMARY(3 个 new-api,加权轮询)里逐站试;任一抽风(429/5xx/网络/空-200)→ 冷却该站、立刻试下一站;**一轮把所有 primary 试完仍失败 → 必定试 FALLBACK(yunwu)再说**;全部失败才放弃(且全站长冷却=配额耗尽时快速失败,不空转)。
+- 401/403:账号级 → 冷却 120s;**内容审计类 403 → 只失败该次调用,不冷却整站**。
+- yunwu 作为 `fallback: true`:**仅当 3 个 new-api 全不可用时才用**,平时 0 流量(省钱)。
+
+### 有界 context(关键:防晚期步 payload 撑爆网关)
+- 图片:滑窗最近 4 轮(≤5 张),已有界。
+- **长期记忆 = gpt-5.4-mini 维护的滚动 `running_log`**(每步增量折叠,硬上限 ~150 词),注入每步输入第一条 user 作 "Notes so far";`webgym/models/web_agent.py:update_running_log`(失败则保留旧 log,不崩),折叠点在 `async_webgym` 步循环里,存进轨迹。
+- 策略**输出不再含会膨胀的 Memory 字段**(只 Thought/Action/tool_call);旧的逐步全量文字摘要已废弃。
+- 训练形态:**逐步 windowed 样本**(每步的 windowed 输入 → action),训练=推理一致。
+
+### 任务过滤
+`scripts/make_remaining_plan.py` 之外,bulk 跑用 `tasks_filtered.jsonl`(全池减去 ~138 个环境不可能任务:下载/打开本地文件、存本地文件、完成支付、带凭据登录)。
+
+### 并发与稳定性教训
+- 瓶颈是 **CPU 核数(浏览器渲染)**,不是内存;loadavg 高多为 I/O 等待,看真实 `%Cpu` idle。
+- `server_size` 要 < omnibox 实例数(留余量),否则实例分配 churn → 503。64 核机器实测 **server_size 50 / omnibox 64** 稳定;128 会把 omnibox 后端搞垮(503 风暴)。
+- **停 rollout 必须用 `scripts/stop_rollout.sh`**(连 worker 池一起杀),否则孤儿 worker 累积压垮 CPU。
+- 清 omnibox 要杀 `deploy.py`(它有进程恢复会 respawn 浏览器)。
+- 监控面板端口 **6006**(AutoDL 自定义服务直接代理)。

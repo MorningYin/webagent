@@ -188,15 +188,20 @@ def capture_screenshot(host, port, api_key, instance, output_dir, step, interact
                         time.sleep(wait_time)
                         continue
                     else:
-                        # After retries exhausted - check if this was due to agent's navigate action
-                        if is_prev_action_navigate and prev_screenshot_path and os.path.exists(prev_screenshot_path):
-                            # Gracefully handle: copy previous screenshot and return with fallback flag
-                            print(f"   🚫 Step {step}: Navigation to '{navigate_url}' resulted in blank page - using previous screenshot")
-                            print(f"   💡 Agent will be notified that the navigation failed")
+                        # After retries exhausted: degrade gracefully whenever we have a
+                        # prior frame (blank page after ANY action — navigate, click, etc.).
+                        # Reusing the last good screenshot + fallback flag keeps the whole
+                        # trajectory (and the gpt-5.4 spend so far) instead of crashing it.
+                        # Only a step-0 blank (no prior frame) is unrecoverable.
+                        if prev_screenshot_path and os.path.exists(prev_screenshot_path):
+                            if is_prev_action_navigate:
+                                print(f"   🚫 Step {step}: Navigation to '{navigate_url}' blank - using previous screenshot (agent notified)")
+                            else:
+                                print(f"   🚫 Step {step}: Blank screenshot after action - using previous screenshot, continuing")
                             shutil.copy(prev_screenshot_path, screenshot_path)
                             return (screenshot_path, True)  # Return with fallback flag
                         else:
-                            # Not a navigate action or no previous screenshot - raise error as before
+                            # No previous frame (e.g. step 0) - genuinely unrecoverable
                             raise Exception(f"Step {step}: Screenshot blank after {max_white_retries} attempts{context_str}")
 
                 # Screenshot is not white, save and return it
