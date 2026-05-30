@@ -18,15 +18,16 @@ policy_config:
   temperature: 1
   top_p: 0.99
   api:
-    base_url: "https://yunwu.ai/v1"
-    model: "gpt-5.4"
-    api_key_env_var: "POLICY_API_KEY"
-    max_retries: 8            # rate-limit resilience: retries 429/5xx/network before failing a step
-    backoff_cap_sec: 60       # max wait between retries (honors server Retry-After header)
+    model: "gpt-5.4"            # default model for all stations
+    max_retries: 8              # transient retries per call (across stations)
+    backoff_cap_sec: 60
+    endpoints:                  # multi-station router: budgets combined, auto-failover
+      - {name: yunwu,  base_url: "https://yunwu.ai/v1",   api_key_env_var: "POLICY_API_KEY_YUNWU",  weight: 1}
+      - {name: newapi, base_url: "https://<NEWAPI_HOST>/v1", api_key_env_var: "POLICY_API_KEY_NEWAPI", weight: 1}
 
 env_config:
-  server_size: 24              # concurrent browsers/trajectories
-  max_vllm_sessions: 24        # concurrent gpt-5.4 calls (yunwu has no rate limit)
+  server_size: 20              # 4-instance headroom under 24-instance omnibox -> avoids 503 churn
+  max_vllm_sessions: 20        # concurrent gpt-5.4 calls (yunwu has no rate limit)
   host_ip: "localhost"
   master_port: 7000
   cpu_cluster_token_env_var: "CPU_CLUSTER_TOKEN"
@@ -36,10 +37,11 @@ env_config:
   split: "train"
   train_tasks: "train.jsonl"
   test_tasks: ""
-  train_tasks_rollout_size: 5000   # <-- 5k trajectories
+  train_tasks_rollout_size: 4500   # top-up: ~904 real already collected; sample more fresh
   test_tasks_rollout_size: 0
   test_tasks_repeat_times: 0
   train_tasks_sampler: "uniform"
+  deduplicate_across_iterations: true   # don't re-sample task names already attempted (keeps the 904)
 
   # real step budgets (easy/medium/hard by difficulty 1-3 / 4-6 / 7+)
   train_difficulty_max_steps:
@@ -50,8 +52,8 @@ env_config:
 
   completion_threshold: 0.95
   completion_grace_period: 30
-  save_traj_progress: true     # resumable: incremental checkpoints every 25%
-  save_every_percent: 25
+  save_traj_progress: true     # resumable: incremental checkpoints
+  save_every_percent: 5        # bank progress early/often on long runs (was 25)
 
 openai_config:
   model: "gpt-5.4-mini"
