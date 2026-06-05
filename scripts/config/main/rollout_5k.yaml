@@ -5,7 +5,7 @@ defaults:
   - rollout
   - _self_
 
-save_path: /root/autodl-tmp/webgym_runs/run_v2   # fresh dir: new-harness data (old run5k kept for reference)
+save_path: /root/autodl-tmp/webgym_runs/run_v3   # RESUME run_v3 in place (keep the 121 already collected). +yunwu/36-worker speedup
 data_path: /root/autodl-tmp/webgym_runs          # holds tasks_filtered.jsonl
 
 model_config:
@@ -18,21 +18,21 @@ policy_config:
   temperature: 1
   top_p: 0.99
   api:
-    model: "gpt-5.4"            # default model for all stations
-    max_retries: 8              # transient retries per call (across stations)
-    backoff_cap_sec: 60
-    endpoints:                  # multi-station router: weighted RR, auto-failover/cooldown
-      # yunwu = fallback only (full price): used solely when all 3 new-api accounts are cooling/down
-      - {name: yunwu,   base_url: "https://yunwu.ai/v1",   api_key_env_var: "POLICY_API_KEY_YUNWU",  weight: 1, fallback: true}
-      # 3 separate new-api accounts (same gateway, independent RPM) = primary workhorses, even split
-      # base_url read from env POLICY_NEWAPI_BASE_URL (keeps the private relay host out of git)
-      - {name: newapi,  base_url_env_var: "POLICY_NEWAPI_BASE_URL", api_key_env_var: "POLICY_API_KEY_NEWAPI",  weight: 1}
-      - {name: newapi2, base_url_env_var: "POLICY_NEWAPI_BASE_URL", api_key_env_var: "POLICY_API_KEY_NEWAPI2", weight: 1}
-      - {name: newapi3, base_url_env_var: "POLICY_NEWAPI_BASE_URL", api_key_env_var: "POLICY_API_KEY_NEWAPI3", weight: 1}
+    model: "gpt-5.4"
+    max_retries: 120            # retry the LOCAL proxy this many times (it does its own backend retries);
+                                # 120 = keep trying through a transient total-outage instead of failing the task
+    backoff_cap_sec: 30
+    # The hand-rolled multi-gateway router is GONE. All backend selection (load-balance across
+    # heiduoke+dkyx, latency-aware routing, cooldown, retry, failover) is delegated to a local
+    # LiteLLM proxy (scripts/litellm_config.yaml, :4000). Here we have ONE endpoint = that proxy.
+    endpoints:
+      - {name: litellm-proxy, base_url_env_var: "POLICY_PROXY_URL", api_key_env_var: "LITELLM_MASTER_KEY"}
 
 env_config:
-  server_size: 50              # 128 destabilized omnibox (503 churn); 50 is stable. CPU was never the limit
-  max_vllm_sessions: 50        # concurrent policy calls (spread over 3 new-api primaries + yunwu fallback)
+  server_size: 36              # parallel task workers. LLM can now do 60 (dkyx+yunwu), so omnibox browser
+                               # capacity (~114, ~3/task -> ~36 workers) is the binding limit. 50 over-saturated
+                               # omnibox -> step-0 blanks; 36 stays under it. Watch step-0 blanks; dial down if they rise.
+  max_vllm_sessions: 40        # dkyx+yunwu pool handles 60 concurrent cleanly; >= server_size so it's non-binding
   host_ip: "localhost"
   master_port: 7000
   cpu_cluster_token_env_var: "CPU_CLUSTER_TOKEN"
@@ -40,30 +40,39 @@ env_config:
   verbose: false
 
   split: "train"
-  train_tasks: "tasks_filtered.jsonl"   # full pool minus 138 env-impossible tasks
+  # TRUE resume of run_v3: load its checkpoint, skip already-completed task_ids, MERGE new trajectories
+  # into run_v3's final file (keeps the 121 already collected — does NOT start over).
+  # RECOVERY after a network outage that step-0-blanked 4433 tasks: merge the 446 GOOD trajectories
+  # (concluded_keep_v2.checkpoint), re-run the 4433 that failed (rerun_list.jsonl). Network is back.
+  resume_checkpoint_path: "/root/autodl-tmp/webgym_runs/run_v3/train_trajectories/concluded_keep_v2.checkpoint"
+  train_tasks: "gapfill_small.jsonl"   # the 4433 tasks that step-0-blanked during the outage
+                                         # -> deterministic continuation: total-to-run shows 4901, final merges to 5000.
   test_tasks: ""
-  train_tasks_rollout_size: 5000   # fresh collection under new harness (prompt + 30/50/80 steps + gpt-5.4 judge)
+  train_tasks_rollout_size: 1040   # gap-fill
   test_tasks_rollout_size: 0
   test_tasks_repeat_times: 0
   train_tasks_sampler: "uniform"
   deduplicate_across_iterations: false
 
   # real step budgets (easy/medium/hard by difficulty 1-3 / 4-6 / 7+)
-  train_difficulty_max_steps:
-    easy: 30
-    medium: 50
-    hard: 80
+  train_difficulty_max_steps:   # set VERY HIGH: paper must not report budget-truncated trajectories;
+    easy: 50
+    medium: 90
+    hard: 140
   test_difficulty_max_steps: []
 
   completion_threshold: 0.95
   completion_grace_period: 30
   save_traj_progress: true     # resumable: incremental checkpoints
-  save_every_percent: 5        # bank progress early/often on long runs (was 25)
+  save_every_percent: 2        # checkpoint more often -> less loss when a restart is needed (was 5)
 
+# Evaluator (reward) + running_log summarizer ALSO go through the local LiteLLM proxy
+# (they call _route_chat, which targets the proxy). base_url/key here point at the proxy too
+# for any direct openai-client path (keypoint/blocking detection).
 openai_config:
-  model: "gpt-5.4-mini"
-  openai_api_key_env_var: "POLICY_API_KEY_YUNWU"   # judge upgraded to gpt-5.4 (yunwu)
-  base_url: "https://yunwu.ai/v1"
+  model: "gpt-5.4"
+  openai_api_key_env_var: "LITELLM_MASTER_KEY"
+  base_url: "${oc.env:POLICY_PROXY_BASE}"
   keypoint_detection:
     model: "gpt-5.4"
   blocking_detection:

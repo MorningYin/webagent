@@ -1,0 +1,79 @@
+# LiteLLM proxy: ONE local AI gateway in front of two flapping relay gateways.
+# Replaces the hand-rolled router in web_agent.py. Battle-tested: load-balancing,
+# per-deployment cooldown, retries, fallback, latency-aware routing.
+#
+# 8 deployments, all model_name=gpt-5.4 (= 4 keys x 2 gateways). LiteLLM picks the
+# fastest-responding healthy deployment and cools/skips ones that error or hang.
+# Secrets via os.environ/* (kept out of git). api_base = the /v1 base (LiteLLM appends path).
+#
+# Launch: scripts/start_litellm.sh  (proxy on :4000). rollout points base_url -> http://localhost:4000
+
+model_list:
+  # ---- gateway A: heiduoke (re-enabled — recovered; relays have a LOW per-gateway concurrency
+  #      ceiling (~5 concurrent each), so both gateways are needed to feed 50 rollout workers) ----
+  # heiduoke DISABLED again: real multimodal calls were 50-60s (vs dkyx ~12-18s) -> it dragged
+  # latency and left 43/50 workers waiting. dkyx-only + relaxed 429 cooldown (below) is faster.
+  # Re-enable these 4 if dkyx alone can't sustain the concurrency (watch for 429s).
+  # - model_name: gpt-5.4
+  #   litellm_params: {model: openai/gpt-5.4, api_base: os.environ/LITELLM_HEIDUOKE_BASE, api_key: os.environ/POLICY_API_KEY_NEWAPI}
+  # - model_name: gpt-5.4
+  #   litellm_params: {model: openai/gpt-5.4, api_base: os.environ/LITELLM_HEIDUOKE_BASE, api_key: os.environ/POLICY_API_KEY_NEWAPI2}
+  # - model_name: gpt-5.4
+  #   litellm_params: {model: openai/gpt-5.4, api_base: os.environ/LITELLM_HEIDUOKE_BASE, api_key: os.environ/POLICY_API_KEY_NEWAPI3}
+  # - model_name: gpt-5.4
+  #   litellm_params: {model: openai/gpt-5.4, api_base: os.environ/LITELLM_HEIDUOKE_BASE, api_key: os.environ/POLICY_API_KEY_NEWAPI4}
+  # ---- gateway B: dkyx (healthy: ~12-18s) — 4 keys ----
+  - model_name: gpt-5.4
+    litellm_params: {model: openai/gpt-5.4, api_base: os.environ/LITELLM_DKYX_BASE, api_key: os.environ/POLICY_API_KEY_NEWAPI}
+  - model_name: gpt-5.4
+    litellm_params: {model: openai/gpt-5.4, api_base: os.environ/LITELLM_DKYX_BASE, api_key: os.environ/POLICY_API_KEY_NEWAPI2}
+  - model_name: gpt-5.4
+    litellm_params: {model: openai/gpt-5.4, api_base: os.environ/LITELLM_DKYX_BASE, api_key: os.environ/POLICY_API_KEY_NEWAPI3}
+  - model_name: gpt-5.4
+    litellm_params: {model: openai/gpt-5.4, api_base: os.environ/LITELLM_DKYX_BASE, api_key: os.environ/POLICY_API_KEY_NEWAPI4}
+  # ---- gateway C: yunwu (1 key, but handles 40+ concurrent easily — added for capacity/speed).
+  #      6 entries (same key) -> ~60% of shuffle traffic, so dkyx (cap ~20) stays under its limit. ----
+  - model_name: gpt-5.4
+    litellm_params: {model: openai/gpt-5.4, api_base: os.environ/LITELLM_YUNWU_BASE, api_key: os.environ/POLICY_API_KEY_YUNWU}
+  - model_name: gpt-5.4
+    litellm_params: {model: openai/gpt-5.4, api_base: os.environ/LITELLM_YUNWU_BASE, api_key: os.environ/POLICY_API_KEY_YUNWU}
+  - model_name: gpt-5.4
+    litellm_params: {model: openai/gpt-5.4, api_base: os.environ/LITELLM_YUNWU_BASE, api_key: os.environ/POLICY_API_KEY_YUNWU}
+  - model_name: gpt-5.4
+    litellm_params: {model: openai/gpt-5.4, api_base: os.environ/LITELLM_YUNWU_BASE, api_key: os.environ/POLICY_API_KEY_YUNWU}
+  - model_name: gpt-5.4
+    litellm_params: {model: openai/gpt-5.4, api_base: os.environ/LITELLM_YUNWU_BASE, api_key: os.environ/POLICY_API_KEY_YUNWU}
+  - model_name: gpt-5.4
+    litellm_params: {model: openai/gpt-5.4, api_base: os.environ/LITELLM_YUNWU_BASE, api_key: os.environ/POLICY_API_KEY_YUNWU}
+
+  # ---- gpt-5.4-mini(仅 yunwu 有)用于廉价数据 A/B ----
+  - model_name: gpt-5.4-mini
+    litellm_params: {model: openai/gpt-5.4-mini, api_base: os.environ/LITELLM_YUNWU_BASE, api_key: os.environ/POLICY_API_KEY_YUNWU}
+
+  # ---- gpt-5.5(仅 dkyx 有)用于离线 segmenter。per-deployment timeout 300s:
+  #      长轨迹(300+ 步)生成耗时远超全局 request_timeout(50s),必须单独放宽。 ----
+  - model_name: gpt-5.5
+    litellm_params: {model: openai/gpt-5.5, api_base: os.environ/LITELLM_DKYX_BASE, api_key: os.environ/POLICY_API_KEY_NEWAPI,  timeout: 300}
+  - model_name: gpt-5.5
+    litellm_params: {model: openai/gpt-5.5, api_base: os.environ/LITELLM_DKYX_BASE, api_key: os.environ/POLICY_API_KEY_NEWAPI2, timeout: 300}
+  - model_name: gpt-5.5
+    litellm_params: {model: openai/gpt-5.5, api_base: os.environ/LITELLM_DKYX_BASE, api_key: os.environ/POLICY_API_KEY_NEWAPI3, timeout: 300}
+  - model_name: gpt-5.5
+    litellm_params: {model: openai/gpt-5.5, api_base: os.environ/LITELLM_DKYX_BASE, api_key: os.environ/POLICY_API_KEY_NEWAPI4, timeout: 300}
+
+router_settings:
+  routing_strategy: simple-shuffle          # uniform over HEALTHY deployments
+  num_retries: 4                            # on failure (429/timeout), retry on a DIFFERENT deployment
+  retry_after: 2
+  allowed_fails: 4                          # tolerate transient 429s; do NOT park a key on a single rate-limit blip
+  cooldown_time: 20                         # 429 is transient -> short park & retry soon. (180s caused pool-collapse
+                                            #  storms: one 429 parked a key 3min -> pool shrank -> everything 429'd -> ~5 effective concurrency)
+
+litellm_settings:
+  ssl_verify: false        # relay certs sometimes ship incomplete chains; key already authenticates
+  request_timeout: 50      # > dkyx real-call latency (~16s, max seen 19s, headroom for image calls); < degraded heiduoke (56-61s) -> cuts it
+  drop_params: true        # tolerate unknown params across backends
+  num_retries: 4
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY   # rollout authenticates to the LOCAL proxy with this

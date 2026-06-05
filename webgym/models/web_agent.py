@@ -72,15 +72,25 @@ class WebAgent:
             self._policy_router_lock = threading.Lock()
             self._policy_rr = 0  # round-robin cursor
 
-        # Configure vLLM HTTP client with connection pooling
+        # Configure vLLM HTTP client with connection pooling.
+        # verify=False: the policy/eval/summarizer all hit user-controlled relay gateways
+        # (中转站) whose Let's Encrypt certs get renewed periodically and sometimes ship an
+        # INCOMPLETE chain (server sends only the leaf -> "unable to verify first certificate").
+        # That broke the entire run once (all stations SSL-failed at once -> tasks died after
+        # 40 sweeps). The API key already authenticates us; skipping chain verification on these
+        # trusted middlemen makes cert-renewal breakage a non-event. Robustness > chain check here.
         self.vllm_client = httpx.Client(
             limits=httpx.Limits(
                 max_connections=2400,
                 max_keepalive_connections=1200,
                 keepalive_expiry=300.0
             ),
-            timeout=httpx.Timeout(vllm_timeout, connect=30.0),
-            http2=False
+            # Talking to the LOCAL LiteLLM proxy: connect is instant; read must cover the proxy's
+            # internal retries (num_retries * request_timeout ≈ 3*45 = 135s) so we don't time out
+            # while the proxy is still failing over across backends.
+            timeout=httpx.Timeout(180.0, connect=8.0),
+            http2=False,
+            verify=False
         )
 
         # Simple semaphore to limit concurrent requests
@@ -136,7 +146,8 @@ class WebAgent:
                 openai_config=openai_config,
                 conversation_builder=self.prompt_constructor,
                 max_retries=max_retries,
-                verbose=verbose
+                verbose=verbose,
+                route_chat=(self._route_chat if self.use_policy_api else None)
             )
 
         # Rolling running-log summarizer (gpt-5.4-mini via openai_config). Maintains a
@@ -157,22 +168,19 @@ class WebAgent:
                 if verbose:
                     print(f"⚠️ running-log summarizer not initialized: {e}")
 
-    _SUMMARIZER_SYSTEM = """You maintain a running research log for a web-browsing agent solving a long, multi-step task. This log is the agent's ONLY memory of everything that scrolled out of its recent screenshots, so it must stay faithful on what matters while staying short.
+    _SUMMARIZER_SYSTEM = """You keep a running research log for a web-browsing agent working through a long, multi-step task. This log is the agent's memory of everything that has scrolled out of its recent screenshots, so keep it faithful to what matters — and naturally compact, since the agent re-reads it on every step.
 
-You are given the current log and ONE new step (the action just taken, the page it led to, whether the page changed, and the agent's own note for that step). Return the updated log.
+You're given the current log and the latest step (the action taken, the page it led to, whether the page changed, and the agent's own note). Fold that step into the log and return the updated version — integrate it, don't just tack on a line.
 
-How to update:
-- INTEGRATE the new step into the log; never just append a new line.
-- ALWAYS preserve, regardless of age: concrete task-relevant facts (names, numbers, dates, prices, URLs, candidate answers), what has been confirmed true or ruled out, dead-ends / approaches that failed (so they are never retried), and where useful information was located.
-- COMPRESS or DROP: superseded page states, repeated restatements, routine navigation/clicks/scrolls/popup-dismissals that produced nothing. Collapse a run of failed attempts into a single line.
-- Keep just enough ordering to show progress and prevent repeating dead-ends; per-step detail is NOT needed.
-- Output ONLY the updated log, in terse note fragments (no prose, no headings, no preamble). Hard limit: under 150 words. If over, compress the oldest non-actionable content first."""
+Keep what would hurt to forget: concrete task-relevant facts (names, numbers, dates, prices, URLs, candidate answers), what's been confirmed or ruled out, dead-ends not worth retrying, and where useful things were found. Let go of what no longer earns its place: superseded page states, routine navigation that led nowhere, repetition; a run of failed attempts can collapse into one line.
+
+Write it as terse notes for the agent's own use — no preamble, no headings, just the log itself."""
 
     def update_running_log(self, prev_log: str, step: Dict) -> str:
-        """Fold one completed trajectory step into the bounded running log via the
-        summarizer model (gpt-5.4-mini). Robust: returns prev_log on any failure."""
+        """Fold one completed trajectory step into the bounded running log, via the SHARED
+        account pool (_route_chat). Robust: returns prev_log on any failure."""
         prev_log = prev_log or ""
-        if not self.running_log_client:
+        if not self.use_policy_api:
             return prev_log
         try:
             at = getattr(step.get('response'), 'answering_tokens', {}) or {}
@@ -188,12 +196,11 @@ How to update:
             user = (f"Current log:\n{prev_log or '(empty — this is the first step)'}\n\n"
                     f"New step:\n- Action: {action_desc}\n- Page after action: {page}\n"
                     f"- Page changed: {changed}\n- Agent's note this step: {note}\n\nUpdated log:")
-            r = self.running_log_client.chat.completions.create(
-                model=self.running_log_model,
-                messages=[{"role": "system", "content": self._SUMMARIZER_SYSTEM},
-                          {"role": "user", "content": user}],
-                max_tokens=2000, timeout=40)
-            out = (r.choices[0].message.content or "").strip()
+            out = self._route_chat(
+                [{"role": "system", "content": self._SUMMARIZER_SYSTEM},
+                 {"role": "user", "content": user}],
+                max_tokens=2000, temperature=0.3, top_p=1.0)
+            out = (out or "").strip()
             return out if out else prev_log
         except Exception:
             return prev_log
@@ -476,6 +483,7 @@ How to update:
                 'weight': max(1, int(g(s, 'weight', 1))),
                 'fallback': bool(g(s, 'fallback', False)),  # used only when no primary is healthy
                 'dead_until': 0.0,    # cooldown end (time.time)
+                'fails': 0,           # consecutive failures -> exponential cooldown (reset on success)
             })
         if specs and not eps:
             raise ValueError(
@@ -489,129 +497,56 @@ How to update:
                 print(f"   (skipped: {skipped})")
         return eps
 
-    def _pick_endpoint(self, exclude=None):
-        """Pick a healthy station, preferring untried PRIMARY stations; if all primaries
-        are tried/cooling this call, escalate to the untried FALLBACK (e.g. yunwu) BEFORE
-        giving up. exclude = set of station names already tried (and failed) this call."""
-        exclude = exclude or set()
-        now = time.time()
-        with self._policy_router_lock:
-            healthy = [e for e in self.policy_endpoints if now >= e['dead_until']]
-            if not healthy:
-                return None
-            for is_fb in (False, True):   # primaries first, then fallback
-                tier = [e for e in healthy if bool(e['fallback']) == is_fb and e['name'] not in exclude]
-                if tier:
-                    pool = []
-                    for e in tier:
-                        pool.extend([e] * e['weight'])
-                    self._policy_rr += 1
-                    return pool[self._policy_rr % len(pool)]
-            return None   # every healthy station already tried this call
-
-    def _mark_endpoint_cooldown(self, ep, seconds, reason):
-        # No permanent disable: even auth/quota errors only cool the station, so a
-        # mid-run top-up / account activation lets it auto-rejoin the rotation.
-        with self._policy_router_lock:
-            ep['dead_until'] = max(ep['dead_until'], time.time() + max(0.5, seconds))
-        print(f"   🧊 policy endpoint '{ep['name']}' cooling {seconds:.0f}s ({reason})")
-
-    def _soonest_recovery(self):
-        now = time.time()
-        with self._policy_router_lock:
-            waits = [e['dead_until'] - now for e in self.policy_endpoints]
-        return min(waits) if waits else None
-
-    def _make_policy_api_request(self, messages: List[Dict]):
-        """Route a policy request across configured OpenAI-compatible stations,
-        with failover (quota/auth -> disable station), cooldown (429/5xx/network),
-        and transient retries. Returns the assistant content string.
+    def _route_chat(self, messages, max_tokens=512, temperature=0.7, top_p=1.0):
+        """Send ONE chat-completion to the local LiteLLM proxy. The proxy owns ALL backend
+        selection: load-balancing across the relay gateways, latency-aware routing,
+        per-deployment cooldown, retry and failover. We just POST and lightly retry the
+        (local) proxy itself. Shared by policy / evaluator / running_log summarizer, so every
+        gpt-5.4 call goes through the same pool. `messages` ready (images inlined). Returns str.
         """
-        import random
-        # Remote stations cannot read local file:// images -> inline as base64 (copy;
-        # originals keep file:// for storage).
-        api_messages = self._inline_images_as_base64(messages)
-        temperature = getattr(self.policy_config, 'temperature', 0.7)
-        top_p = getattr(self.policy_config, 'top_p', 1.0)
-        max_tokens = getattr(self.policy_config, 'max_new_tokens', 512)
+        ep = self.policy_endpoints[0]   # single endpoint now: the local LiteLLM proxy
+        payload = {"model": ep['model'], "messages": messages,
+                   "temperature": temperature, "top_p": top_p, "max_tokens": max_tokens}
+        headers = {"Content-Type": "application/json",
+                   "Authorization": f"Bearer {ep['key']}"}
         max_retries = self.policy_api_max_retries
         cap = self.policy_api_backoff_cap
-        RETRYABLE = {408, 409, 425, 500, 502, 503, 504, 522, 524}  # 429/401/403 handled specially
-
-        def backoff(a, ra=None):
-            if ra is not None:
-                return min(ra, cap)
-            return min(cap, (2 ** a) * (0.5 + random.random()))
-
-        cycles = 0       # full sweeps through all stations; each sweep tries every healthy
-        tried = set()    # station INCLUDING the fallback (yunwu) before a sweep counts as failed
+        last = "no attempt"
         with self.vllm_semaphore:
-            while True:
-                ep = self._pick_endpoint(exclude=tried)
-                if ep is None:
-                    # Every healthy station (primaries + fallback) was tried this sweep, or all
-                    # are cooling. Short cooldowns -> wait and sweep again; everything down for
-                    # a long time (auth/quota) -> fail fast instead of holding the worker.
-                    cycles += 1
-                    wait = max(0.0, self._soonest_recovery() or 0.0)
-                    if wait > 30 or cycles > max_retries:
-                        raise Exception(f"policy router: all stations failing/cooling after {cycles} sweeps (next recovery ~{wait:.0f}s)")
-                    tried.clear()
-                    time.sleep(min(max(wait, backoff(cycles)), 30))
-                    continue
-
-                payload = {"model": ep['model'], "messages": api_messages,
-                           "temperature": temperature, "top_p": top_p, "max_tokens": max_tokens}
-                headers = {"Content-Type": "application/json",
-                           "Authorization": f"Bearer {ep['key']}"}
+            for attempt in range(max_retries):
                 try:
                     r = self.vllm_client.post(ep['url'], json=payload, headers=headers)
-                    code = r.status_code
-
-                    if code == 200:
+                    if r.status_code == 200:
                         try:
                             m = r.json()["choices"][0]["message"]
                             content = m.get("content") or ""
                             if m.get("reasoning_content"):
                                 content = f"<think>\n{m['reasoning_content']}\n</think>\n\n{content}"
-                            if not content.strip():
-                                raise ValueError("empty content in 200 response")
-                            return content
-                        except (ValueError, KeyError, IndexError, TypeError):
-                            # empty / malformed 200 body -> try the next station immediately
-                            tried.add(ep['name'])
-                            continue
-
-                    body = r.text[:200]
-                    if code in (401, 403):
+                            if content.strip():
+                                return content
+                            last = "empty 200"
+                        except (ValueError, KeyError, IndexError, TypeError) as e:
+                            last = f"malformed 200: {e}"
+                    else:
+                        body = r.text[:200]
                         low = body.lower()
-                        # Per-request content moderation (not a station problem) -> fail this
-                        # call only; do NOT cool / blame the station.
-                        if any(m in low for m in ("content_policy", "内容审计", "审计命中", "风险规则", "content policy", "sensitive")):
-                            raise Exception(f"policy content rejected by '{ep['name']}' {code}: {body[:120]}")
-                        # account-level auth/quota -> cool station, fail over to next.
-                        self._mark_endpoint_cooldown(ep, 120, f"{code} {body[:60]}")
-                        tried.add(ep['name'])
-                        continue
-                    if code == 429:
-                        ra = r.headers.get("retry-after")
-                        try: ra = float(ra) if ra is not None else None
-                        except (TypeError, ValueError): ra = None
-                        self._mark_endpoint_cooldown(ep, ra if ra else 5.0, "429")
-                        tried.add(ep['name'])
-                        continue
-                    if code in RETRYABLE:
-                        # transient gateway error (502/503/504...) -> brief cool, next station now
-                        self._mark_endpoint_cooldown(ep, 3.0, str(code))
-                        tried.add(ep['name'])
-                        continue
-                    # other 4xx (e.g. 400 bad request) -> non-retryable everywhere
-                    raise Exception(f"policy non-retryable {code} from '{ep['name']}': {body}")
-
+                        # per-request content moderation -> deterministic, don't burn retries
+                        if any(k in low for k in ("content_policy", "内容审计", "审计命中", "风险规则", "content policy", "sensitive")):
+                            raise Exception(f"policy content rejected {r.status_code}: {body[:120]}")
+                        last = f"{r.status_code} {body[:140]}"
                 except httpx.HTTPError as e:
-                    self._mark_endpoint_cooldown(ep, 3.0, "network")
-                    tried.add(ep['name'])
-                    continue
+                    # the LOCAL proxy is unreachable (rare) -> brief wait & retry
+                    last = f"proxy network: {str(e)[:120]}"
+                time.sleep(min(cap, 1.5 * (attempt + 1)))
+            raise Exception(f"policy proxy failed after {max_retries} attempts (last: {last})")
+
+    def _make_policy_api_request(self, messages: List[Dict]):
+        """Policy step: inline file:// images to base64, then route via the shared pool."""
+        return self._route_chat(
+            self._inline_images_as_base64(messages),
+            max_tokens=getattr(self.policy_config, 'max_new_tokens', 512),
+            temperature=getattr(self.policy_config, 'temperature', 0.7),
+            top_p=getattr(self.policy_config, 'top_p', 1.0))
 
     def _build_http_messages(self, system_prompt: str, user_prompt: str,
                            screenshot_path: str, trajectory: list = None):

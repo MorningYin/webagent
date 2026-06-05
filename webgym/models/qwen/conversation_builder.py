@@ -21,18 +21,20 @@ class QwenConversationBuilder(ConversationBuilder):
         if self.variant not in ['instruct', 'thinking']:
             raise ValueError(f"Invalid variant: {variant}. Must be 'instruct' or 'thinking'")
 
-        if self.prompt_version not in ['vanilla', 'complete']:
-            raise ValueError(f"Invalid prompt_version: {prompt_version}. Must be 'vanilla' or 'complete'")
+        if self.prompt_version not in ['vanilla', 'complete', 'mini']:
+            raise ValueError(f"Invalid prompt_version: {prompt_version}. Must be 'vanilla', 'complete' or 'mini'")
 
     def build_conversation(self, task: str, trajectory: List[Dict], current_observation: Dict, **kwargs) -> List[Dict]:
         """
-        Build multi-turn conversation history with 4-round sliding window
+        Build multi-turn conversation history with 2-round sliding window
 
         Following OSWorld desktop computer-use approach:
-        - Keep last 4 rounds as explicit history (with images)
-        - Summarize anything older than 4 rounds as text in first user message
+        - Keep last 2 rounds as explicit history (with images)
+        - Summarize anything older than 2 rounds as text (running_log) in first user message
         - Add current screenshot as final user message
-        - Total: 5 images (4 historical + 1 current)
+        - Total: 3 images (2 historical + 1 current). running_log carries long-term memory,
+          so few recent images suffice for grounding -> ~40% fewer image tokens, faster calls.
+          NOTE: window size is a TRAIN=INFERENCE consistency parameter — FIXED for the whole 5k run.
 
         Args:
             task: Task description
@@ -43,7 +45,7 @@ class QwenConversationBuilder(ConversationBuilder):
             List of message dicts (system, user, assistant alternating)
         """
         messages = []
-        HISTORY_WINDOW = 4  # Keep last 4 rounds as explicit history
+        HISTORY_WINDOW = 2  # Keep last 2 rounds as explicit history (3 images total w/ current); running_log carries the rest
 
         # 1. System message with tool definition
         messages.append(self._build_system_message())
@@ -132,20 +134,76 @@ class QwenConversationBuilder(ConversationBuilder):
             # Complete version: includes Progress, Intention, Action, and tool call
             response_format = """
 
-# How to respond
+# How to work
 
-For each step, output these parts in order:
-1) Thought: reason about what you currently see and the single objective you are pursuing right now — what you are trying to achieve at this moment and how your next action moves it forward. If the objective you were just pursuing has succeeded or has proven blocked, say so here before turning to the next one. Reason about the present situation only; do not pre-plan the whole task or enumerate future subtasks.
-2) Action: one short sentence describing the UI action you will take.
-3) A single <tool_call>...</tool_call> block containing only the JSON: {"name": <function-name>, "arguments": <args-json-object>}.
+Each step, write three things in order:
 
-A running record of your earlier findings is provided to you under "Notes so far" — rely on it for facts from steps that have scrolled out of view; you do not need to restate it.
+1) Thought — what you see on the screen right now, and the one objective you're pursuing at this moment: what you're trying to get done and how your next action moves it forward. If the objective you were just on has succeeded or hit a wall, say so before turning to the next one. Think about the situation in front of you — you don't need to plan the whole task ahead or list out future steps.
+2) Action — one plain sentence saying what you're about to do.
+3) A single <tool_call>...</tool_call> block with only the JSON: {"name": <function-name>, "arguments": <args-json-object>}.
 
-Work like a focused researcher:
-- Pursue one objective at a time. Stay on it until you achieve it or confirm it is blocked — never switch to an unrelated direction in the middle of one.
-- Treat each objective as a self-contained unit of work with a clear point and a clear outcome.
-- Ground every action in what is actually on the current screen. If a page is blocked, blank, or interrupts you (cookie/consent/popup), handle that as part of the objective you are on rather than abandoning it.
-- Once the task is fully answered by what you have actually seen, give the final answer."""
+Work the way a careful researcher does: hold one objective at a time and see it through until it's done or clearly blocked, rather than darting between directions — each objective is a self-contained piece of work with a point and an outcome. Ground every action in what's actually on the screen; when a page is blank, blocked, or throws up a cookie/consent/popup, handle it as part of what you're already doing. Your earlier findings are kept for you under "Notes so far" — lean on it for anything that has scrolled out of view, no need to restate it. Once what you've genuinely seen answers the task, give the final answer."""
+        elif self.prompt_version == "mini":
+            # Mini version: small-model-optimized — STRONG explicit format rules + few-shot,
+            # because smaller models drop the <tool_call>, mis-name it, or answer in plain text.
+            response_format = """
+
+# How to respond — follow this format EXACTLY, every single step
+
+Output exactly three parts, in order:
+1) Thought: one short sentence — what you see and the single objective right now.
+2) Action: one short sentence — what you will do.
+3) A <tool_call> block. THIS IS MANDATORY: every response MUST end with one <tool_call> block.
+
+The tool_call is ALWAYS this shape — copy it exactly:
+<tool_call>
+{"name": "computer_use", "arguments": {"action": "<left_click|type|scroll|wait|go_back|navigate|answer>", ...}}
+</tool_call>
+
+RULES YOU MUST NOT BREAK:
+- "name" is ALWAYS "computer_use". NEVER use the action as the name. WRONG: {"name":"navigate"}. RIGHT: {"name":"computer_use","arguments":{"action":"navigate","url":"..."}}.
+- The action ALWAYS goes inside "arguments" as "action".
+- To finish, you MUST submit with the answer action. NEVER write the final answer as plain text — it will not count.
+- Never output a response without a <tool_call> block.
+
+EXAMPLES — copy these formats exactly:
+
+navigate:
+Thought: I'm on Google; I should go straight to a source site.
+Action: Navigate to Wikipedia.
+<tool_call>
+{"name": "computer_use", "arguments": {"action": "navigate", "url": "https://en.wikipedia.org"}}
+</tool_call>
+
+click:
+Thought: The search box is near the top; I'll click it.
+Action: Click the search box.
+<tool_call>
+{"name": "computer_use", "arguments": {"action": "left_click", "coordinate": [512, 80]}}
+</tool_call>
+
+type:
+Thought: I'll search for the person.
+Action: Type the query.
+<tool_call>
+{"name": "computer_use", "arguments": {"action": "type", "coordinate": [512, 80], "text": "John Smith actor birthplace"}}
+</tool_call>
+
+scroll:
+Thought: The answer may be lower on the page.
+Action: Scroll down.
+<tool_call>
+{"name": "computer_use", "arguments": {"action": "scroll", "direction": "down"}}
+</tool_call>
+
+FINAL ANSWER (you MUST do this to finish — do not write the answer as plain text):
+Thought: The page confirms the city, so I can answer now.
+Action: Submit the final answer.
+<tool_call>
+{"name": "computer_use", "arguments": {"action": "answer", "text": "Milwaukee, Wisconsin"}}
+</tool_call>
+
+Work one objective at a time, ground every action in what's on the screen, and the moment what you've seen answers the task, submit with the answer action. Your earlier notes are under "Notes so far"."""
         else:
             # Vanilla version: minimal format without Thoughts or Memory
             response_format = """
@@ -161,18 +219,16 @@ Rules:
 - Action describes the high-level intention of the tool call within a single sentence.
 - Do not output anything else outside those two parts."""
 
-        system_content = f"""You are a helpful assistant.
+        system_content = f"""You are an autonomous web-browsing agent. You're given a task and a live browser, and you work through it yourself — navigating, reading what's on the page, and acting on what you see — until you can answer from what you've actually observed.
 
 # Tools
 
-You may call one or more functions to assist with the user query.
-
-You are provided with function signatures within <tools></tools> XML tags:
+You drive the browser by calling functions. Their signatures are in <tools></tools>:
 <tools>
 {tool_def}
 </tools>
 
-For each function call, return a JSON object with function name and arguments within <tool_call></tool_call> XML tags:
+Return each call as a JSON object with the function name and arguments inside <tool_call></tool_call> tags:
 <tool_call>
 {{"name": <function-name>, "arguments": <args-json-object>}}
 </tool_call>{response_format}"""

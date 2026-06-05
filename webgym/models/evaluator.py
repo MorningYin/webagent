@@ -24,7 +24,7 @@ class Evaluator:
     TASK_BLOCKING_DETECTION = "blocking_detection"
     TASK_EVALUATION = "evaluation"  # Covers criterion_a, criterion_b, and reference_answer
 
-    def __init__(self, openai_config: Dict, conversation_builder=None, max_retries: int = 1, verbose: bool = True):
+    def __init__(self, openai_config: Dict, conversation_builder=None, max_retries: int = 1, verbose: bool = True, route_chat=None):
         """
         Initialize Evaluator.
 
@@ -47,12 +47,25 @@ class Evaluator:
         self.conversation_builder = conversation_builder
         self.max_retries = max_retries
         self.verbose = verbose
+        # When set, ALL evaluator chat calls go through the shared account pool
+        # (round-robin + cooldown + failover across the 3 new-api accounts).
+        self.route_chat = route_chat
 
         # Cache for clients (keyed by (api_key_env_var, base_url))
         self._clients = {}
 
         # Initialize clients for all configured tasks
         self._setup_clients()
+
+    def _chat(self, messages, max_tokens, temperature=0.7, fb_client=None, fb_model=None):
+        """One evaluator chat call. Prefer the shared pool (route_chat); else the
+        task-specific client. Returns the response content string."""
+        if self.route_chat is not None:
+            return self.route_chat(messages, max_tokens=max_tokens, temperature=temperature, top_p=0.95)
+        completion = fb_client.chat.completions.create(
+            model=fb_model, messages=messages, max_tokens=max_tokens,
+            temperature=temperature, top_p=0.95, stream=False)
+        return completion.choices[0].message.content
 
     def _get_task_config(self, task_type: str) -> Dict:
         """Get merged configuration for a specific task type.
@@ -219,16 +232,7 @@ class Evaluator:
             ]
 
             # Call API
-            completion = eval_client.chat.completions.create(
-                model=eval_model,
-                messages=messages,
-                max_tokens=800,
-                temperature=0.7,
-                top_p=0.95,
-                stream=False
-                #reasoning_effort="minimal"  # add this only for reasoning models
-            )
-            response = completion.choices[0].message.content
+            response = self._chat(messages, max_tokens=800, fb_client=eval_client, fb_model=eval_model)
 
             criterion_b_result, _ = self._extract_verification_response(response)
             criterion_b_passed = (criterion_b_result == 1)
@@ -287,16 +291,7 @@ class Evaluator:
                 ]
 
                 # Call API
-                completion = eval_client.chat.completions.create(
-                    model=eval_model,
-                    messages=messages,
-                    max_tokens=800,
-                    temperature=0.7,
-                    top_p=0.95,
-                    stream=False
-                    #reasoning_effort="minimal"  # add this only for reasoning models
-                )
-                response = completion.choices[0].message.content
+                response = self._chat(messages, max_tokens=800, fb_client=eval_client, fb_model=eval_model)
 
                 verification_result, _ = self._extract_verification_response(response)
                 criterion_a_results.append(verification_result)
@@ -344,16 +339,7 @@ The agent's response should either:
                     }
                 ]
 
-                completion = eval_client.chat.completions.create(
-                    model=eval_model,
-                    messages=messages,
-                    max_tokens=800,
-                    temperature=0.7,
-                    top_p=0.95,
-                    stream=False
-                    #reasoning_effort="minimal"  # add this only for reasoning models
-                )
-                response = completion.choices[0].message.content
+                response = self._chat(messages, max_tokens=800, fb_client=eval_client, fb_model=eval_model)
 
                 verification_result, _ = self._extract_verification_response(response)
                 criterion_a_results.append(verification_result)
@@ -459,16 +445,7 @@ The agent's response should either:
             ]
 
             # Call API
-            completion = blocking_client.chat.completions.create(
-                model=blocking_model,
-                messages=messages,
-                max_tokens=500,
-                temperature=0.7,
-                top_p=0.95,
-                stream=False
-                #reasoning_effort="minimal"  # add this only for reasoning models
-            )
-            response = completion.choices[0].message.content
+            response = self._chat(messages, max_tokens=500, fb_client=blocking_client, fb_model=blocking_model)
 
             # Parse response for blocking status
             is_blocked = self._extract_blocking_status(response)
@@ -576,16 +553,7 @@ The snapshot of the web page is shown in the image. Does this image contain rele
                     ]
 
                     # Call API using task-specific client and model
-                    completion = keypoint_client.chat.completions.create(
-                        model=keypoint_model,
-                        messages=messages,
-                        max_tokens=600,
-                        temperature=0.7,
-                        top_p=0.95,
-                        stream=False
-                        #reasoning_effort="minimal"  # add this only for reasoning models
-                    )
-                    response = completion.choices[0].message.content
+                    response = self._chat(messages, max_tokens=600, fb_client=keypoint_client, fb_model=keypoint_model)
 
                     # Parse decision
                     should_submit = self._extract_submission_decision(response)
@@ -726,16 +694,7 @@ Response format:
             ]
 
             # Call API
-            completion = blocking_client.chat.completions.create(
-                model=blocking_model,
-                messages=messages,
-                max_tokens=300,
-                temperature=0.3,  # Lower temperature for more consistent detection
-                top_p=0.95,
-                stream=False
-                #reasoning_effort="minimal"  # add this only for reasoning models
-            )
-            response = completion.choices[0].message.content
+            response = self._chat(messages, max_tokens=300, temperature=0.3, fb_client=blocking_client, fb_model=blocking_model)
 
             # Parse response for blocking status
             is_blocked = self._extract_blocking_status(response)
