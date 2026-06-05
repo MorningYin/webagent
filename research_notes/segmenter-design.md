@@ -1,0 +1,28 @@
+---
+name: segmenter-design
+description: WebGym Stage 2 segmenter.py — gpt-5.5/dkyx streaming cut of trajectories into contiguous credit-bearing skill segments (observation/purpose/summary/result)
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 7ef814bf-ea0d-4210-b65d-decb9ca2ed1a
+---
+
+`scripts/segmenter.py` is Stage 2 of the WebGym data pipeline. It flattens one rollout trajectory and asks a strong model to cut it into structured, contiguous SKILL SEGMENTS for credit assignment.
+
+**Input/Output.** Input = `clean_dataset/dataset.jsonl` (per-trajectory; `flatten()` builds `TASK: ...` header + one line per step `[n] <action> | page: <title> | thought: <~140 chars>`, dropping the blank step-0 with no action/thought). Output = `segments.jsonl`, one JSON line per trajectory: `{task_id, source, reward, num_steps, first_step, last_step, n_segments, segments:[...]}`.
+
+**Model / transport.** Model = `gpt-5.5`, dkyx (newapi) gateway ONLY — security constraint: gpt-5.5 only exists on dkyx/newapi. `call_dkyx()` uses STREAMING SSE (`"stream": True`, timeout 300, `verify=False`, key rotation across `POLICY_API_KEY_NEWAPI[,2,3,4]`, 5 retries). Streaming is REQUIRED: it keeps bytes flowing so the relay's openresty `proxy_read_timeout` resets per-chunk; whole-response (non-streamed) generation on long trajectories (300+ steps) hits 504 Gateway Timeout. A later accidental revert of streaming reintroduced 504s — do not undo it. Concurrency: c8 stable on dkyx (~13-15/min); c16 overwhelms dkyx (throughput collapses to ~4/min). `--via-proxy` reroutes through the local LiteLLM proxy (:4000) which load-balances the 4 dkyx keys; offline batch otherwise never touches the rollout proxy.
+
+**What a segment is.** A CONTIGUOUS run of steps = the largest block that still represents ONE locally judgeable task-state-transition attempt (one "skill") — not a primitive action, not the whole task. Every step lands in exactly one segment, head-to-tail. PURELY DESCRIPTIVE, NOT evaluative (the prompt forbids assigning reward/correctness/success; the model is not the judge). Four fields per segment: `observation` = state BEFORE the transition (page/source/known facts/unresolved requirements/active candidate/obstacle/failed routes, only what's knowable at segment start); `purpose` = the INTENDED forward-looking local transition (a sub-goal, NOT a UI op, NOT a success condition; vague "continue searching"/"find the answer" banned); `summary` = the PROCESS actually done (actions, queries, retries, tactic switches, recoveries — don't hide repeats/failures); `result` = the resulting after-state (where the browser ended, what changed/remained missing/stalled; say so explicitly if no new info; never claim final success unless a final answer is submitted).
+
+**Boundary rule (heavily iterated, critical).** Cut a new segment ONLY when the LOCAL state-transition attempt changes — i.e. when the gap (unresolved sub-goal), the candidate (different item/source object/obstacle), the operation type (discover→reach→extract→verify→recover→submit), or the target state changes. Do NOT cut merely because the agent switches source/website/path/tactic, scrolls, types, waits, or retries after a failure. A source/path switch is a boundary only if it also changes gap/candidate/operation/target. Keep same segment when different actions/sources are just tactics for the same precise attempt (same clue across search UIs, retry a blocked page, direct-URL after a failed click, URL variants for the same artifact). New segment on discovery→inspection, inspection→extraction, extraction→verification, candidate→candidate, requirement→requirement, obstacle-handling→info-gathering, info-gathering→final-answer.
+
+**User feedback that drove the design.** Early segmentation was "too碎" (too fragmented, 1-step-heavy). User insisted segments be skill-level because single actions can't be credited. Investigation: candidate-flipping (one candidate per step) is LEGITIMATELY 1-step, while source-switching should merge. New prompt cut 1-step segments from ~37% (old prompt) to ~31%. Full run twice over 2706 traj, both with 0 errored / 0 non-contiguous: old prompt 18412 segs, new prompt 16386 segs.
+
+**Validation / resume.** `validate()` checks contiguity, head-to-tail coverage, inclusive start/end, no gaps/overlaps; `segment_one()` retries once on invalid/non-JSON. Resume: rewrites out-file keeping only good records (no error + non-empty segments), re-runs errored/missing task_ids in append mode.
+
+**Downstream mapping.** The four fields map to the OLD towr-webgym `BoundarySegment` schema (purpose/work_done/result/planner_reasoning) and feed `segment_beginner(observation, purpose)` / `segment_stopper(summary, result)` meta-calls. See [[segment-sft-pipeline]] (Stage 3 consumer), [[clean-dataset-artifacts]] (Stage 1 input), [[within-segment-summary-design]], and [[webgym-closed-api-rollout-setup]] (the dkyx/LiteLLM transport this reuses).
+
+**Why:** Segments are the unit of credit assignment — too fine (1-step) can't be credited, too coarse hides distinct attempts; the boundary rule and descriptive-only fields exist so a later judge can score before→actions→after per skill, and streaming-SSE is the only thing that keeps long-trajectory calls under the relay's 504 timeout.
+
+**How to apply:** Run via `source scripts/start_litellm.sh` then `python scripts/segmenter.py --in <dataset.jsonl> --out <segments.jsonl> --model gpt-5.5 --concurrency 8`; keep streaming and stay on dkyx for gpt-5.5; never raise concurrency past ~8 on dkyx; when editing the SYSTEM prompt, preserve the local-transition boundary rule and the descriptive (non-evaluative) framing of the four fields.
